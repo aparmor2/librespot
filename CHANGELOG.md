@@ -9,10 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+<<<<<<< HEAD
 - [connect] Retain playback snapshots after an unexpected disconnect so clients can restore context, shuffle order, and queued tracks on a new session
 - [core] Add an in-memory credential cache for clients that persist grants in a protected store
 - [core] Add method `get_playlist_range` to `SpClient` for a window of a playlist's items with its header decorated on
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
+=======
+- [connect] Experimental DJ session resolution and on-demand continuation pages
+- [playback] Optional Spotify narration through the existing decoder, with
+  mono speech conversion, bounded downloads, independent loudness, and a
+  stationary song clock during speech
+- [playback] `Narration` player event (breaking for exhaustive event matches)
+- [connect] Occurrence-aware DJ set jumps that preserve manually queued songs
+- [connect] Automatically keep DJ sessions unshuffled, including incoming transfers
+- [playback] DJ context/next-set state and rejected-jump events (breaking for exhaustive event matches)
+>>>>>>> 3c79ae7 (Support experimental Spotify DJ sessions and narration)
 
 ### Fixed
 

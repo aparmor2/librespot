@@ -14,6 +14,7 @@ use crate::{
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
+        narration::Narration,
         player::{Player, PlayerEvent, PlayerEventChannel},
     },
     protocol::{
@@ -100,6 +101,7 @@ struct SpircTask {
 
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
+    pending_dj_transfer: bool,
 
     /// when set to true, it will update the volume after [VOLUME_UPDATE_DELAY],
     /// when no other future resolves, otherwise resets the delay
@@ -122,6 +124,7 @@ enum SpircCommand {
     Pause,
     Prev,
     Next,
+    DjNextSet(String),
     ClearQueue,
     AddToQueue(String),
     VolumeUp,
@@ -233,7 +236,8 @@ impl Spirc {
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
         debug!("new Spirc[{spirc_id}]");
 
-        let connect_state = ConnectState::new(config, &session);
+        let mut connect_state = ConnectState::new(config, &session);
+        connect_state.set_dj_support(player.supports_narration());
 
         let connection_id_update = session
             .dealer()
@@ -310,6 +314,7 @@ impl Spirc {
             player_events: Some(player_events),
 
             context_resolver: ContextResolver::new(session.clone()),
+            pending_dj_transfer: false,
 
             shutdown: false,
             session,
@@ -386,6 +391,11 @@ impl Spirc {
     /// Does nothing if we are not the active device.
     pub fn next(&self) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Next)?)
+    }
+
+    /// Skip the rest of the current DJ set, preserving manually queued songs.
+    pub fn dj_next_set(&self, expected_uid: String) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::DjNextSet(expected_uid))?)
     }
 
     /// Removes every queued track, keeping the playing context's own tracks.
@@ -686,6 +696,9 @@ impl SpircTask {
                 self.context_resolver.mark_next_unavailable();
                 self.context_resolver.remove_used_and_invalid();
                 error!("{why}");
+                if self.pending_dj_transfer {
+                    self.handle_stop();
+                }
                 return false;
             }
             Ok(ctx) => ctx,
@@ -718,6 +731,13 @@ impl SpircTask {
         };
 
         self.context_resolver.remove_used_and_invalid();
+        if update_state && std::mem::take(&mut self.pending_dj_transfer) {
+            if let Some((play, position)) = self.play_status.pending_load() {
+                if let Err(error) = self.load_track(play, position) {
+                    error!("Unable to finish DJ transfer: {error}");
+                }
+            }
+        }
         update_state
     }
 
@@ -758,6 +778,7 @@ impl SpircTask {
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
                 warn!("SpircCommand::{cmd:?} will be ignored while already active")
             }
+<<<<<<< HEAD
             SpircCommand::Restore(snapshot) => {
                 if self.connect_state.is_active()
                     && !matches!(self.play_status, SpircPlayStatus::Stopped)
@@ -776,6 +797,11 @@ impl SpircTask {
             // `set_volume` records it in the device state and the mixer and
             // withholds the player event, and activation then reports it.
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
+=======
+            SpircCommand::DjNextSet(_) if !self.connect_state.is_active() => {
+                self.player.emit_dj_jump_rejected();
+            }
+>>>>>>> 3c79ae7 (Support experimental Spotify DJ sessions and narration)
             _ if !self.connect_state.is_active() => {
                 warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
             }
@@ -790,6 +816,15 @@ impl SpircTask {
             SpircCommand::Pause => self.handle_pause(),
             SpircCommand::Prev => self.handle_prev()?,
             SpircCommand::Next => self.handle_next(None)?,
+            SpircCommand::DjNextSet(uid) => {
+                if self.connect_state.jump_to_dj_set(&uid).is_ok() {
+                    self.player.emit_repeat_changed_event(false, false);
+                    self.load_track_with_narration(true, 0, true)?;
+                    self.add_autoplay_resolving_when_required();
+                } else {
+                    self.player.emit_dj_jump_rejected();
+                }
+            }
             SpircCommand::ClearQueue => self.handle_clear_queue(),
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri),
             SpircCommand::VolumeUp => self.handle_volume_up(),
@@ -831,6 +866,21 @@ impl SpircTask {
         }
 
         match event {
+            PlayerEvent::Narration {
+                active,
+                position_ms,
+                ..
+            } => {
+                self.connect_state.narrating = active;
+                let now = self.now_ms();
+                self.connect_state.update_position(position_ms, now);
+                if let SpircPlayStatus::Playing {
+                    nominal_start_time, ..
+                } = &mut self.play_status
+                {
+                    *nominal_start_time = now - i64::from(position_ms);
+                }
+            }
             PlayerEvent::EndOfTrack { .. } => {
                 let next_track = self
                     .connect_state
@@ -1211,6 +1261,17 @@ impl SpircTask {
     }
 
     fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
+        self.pending_dj_transfer = false;
+        let dj_transfer = transfer
+            .current_session
+            .context
+            .url()
+            .starts_with("hm://lexicon-session-provider/")
+            || transfer
+                .current_session
+                .context
+                .metadata
+                .contains_key("lexicon_context_url");
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
             // can apparently happen when a state is transferred and was started with "uris" via the api
@@ -1243,9 +1304,11 @@ impl SpircTask {
 
         match ctx_uri {
             Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
-                    uri.clone(),
-                    &fallback,
+                let mut context = transfer.current_session.context.clone().unwrap_or_default();
+                context.uri = Some(uri.clone());
+                self.context_resolver.clear();
+                self.context_resolver.add(ResolveContext::from_context(
+                    context,
                     ContextType::Default,
                     ContextAction::Replace,
                 ));
@@ -1329,10 +1392,30 @@ impl SpircTask {
             }
         }
 
-        self.load_track(is_playing, position.try_into()?)
+        let position = position.try_into()?;
+        if dj_transfer && load_from_context_uri {
+            // Wait for the session's per-track metadata before preparing audio.
+            self.player.stop();
+            self.play_request_id = None;
+            self.connect_state.narrating = false;
+            self.pending_dj_transfer = true;
+            self.play_status = if is_playing {
+                SpircPlayStatus::LoadingPlay {
+                    position_ms: position,
+                }
+            } else {
+                SpircPlayStatus::LoadingPause {
+                    position_ms: position,
+                }
+            };
+            Ok(())
+        } else {
+            self.load_track(is_playing, position)
+        }
     }
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
+        self.pending_dj_transfer = false;
         self.context_resolver.clear();
 
         self.play_status = SpircPlayStatus::Stopped {};
@@ -1349,6 +1432,8 @@ impl SpircTask {
     }
 
     fn handle_stop(&mut self) {
+        self.pending_dj_transfer = false;
+        self.connect_state.narrating = false;
         self.player.stop();
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
@@ -1393,6 +1478,7 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        self.pending_dj_transfer = false;
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -1460,8 +1546,7 @@ impl SpircTask {
             self.connect_state.set_repeat_track(options.repeat_track);
         }
 
-        if matches!(cmd_options.context_options, Some(LoadContextOptions::Options(ref o)) if o.shuffle)
-        {
+        if self.connect_state.shuffling_context() {
             if let Some(index) = index {
                 self.connect_state.set_current_track(index)?;
             } else {
@@ -1598,11 +1683,11 @@ impl SpircTask {
     fn handle_pause(&mut self) {
         match self.play_status {
             SpircPlayStatus::Playing {
-                nominal_start_time,
                 preloading_of_next_track_triggered,
+                ..
             } => {
                 self.player.pause();
-                let position_ms = (self.now_ms() - nominal_start_time) as u32;
+                let position_ms = self.position();
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
                 self.play_status = SpircPlayStatus::Paused {
@@ -1619,6 +1704,7 @@ impl SpircTask {
     }
 
     fn handle_seek(&mut self, position_ms: u32) {
+        self.connect_state.narrating = false;
         let duration = self.connect_state.player().duration;
         if i64::from(position_ms) > duration {
             warn!("tried to seek to {position_ms}ms of {duration}ms");
@@ -1649,8 +1735,10 @@ impl SpircTask {
     }
 
     fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
-        self.player.emit_shuffle_changed_event(shuffle);
-        self.connect_state.handle_shuffle(shuffle)
+        let result = self.connect_state.handle_shuffle(shuffle);
+        self.player
+            .emit_shuffle_changed_event(self.connect_state.shuffling_context());
+        result
     }
 
     fn handle_repeat_context(&mut self, repeat: bool) -> Result<(), Error> {
@@ -1682,7 +1770,15 @@ impl SpircTask {
         }
 
         if let Some(track_id) = self.connect_state.preview_next_track() {
-            self.player.preload(track_id);
+            let track = if self.connect_state.repeat_track() {
+                self.connect_state.player().track.as_ref()
+            } else {
+                self.connect_state.player().next_tracks.first()
+            };
+            let narration = track
+                .map(|track| Narration::from_metadata(&track.metadata, false, 0))
+                .unwrap_or_default();
+            self.player.preload_with_narration(track_id, narration);
         }
     }
 
@@ -1695,6 +1791,29 @@ impl SpircTask {
     }
 
     fn add_autoplay_resolving_when_required(&mut self) {
+        if let Some(page) = self.connect_state.next_context_page() {
+            if !self
+                .connect_state
+                .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
+            {
+                self.context_resolver.add(ResolveContext::from_uri(
+                    page,
+                    "",
+                    ContextType::Default,
+                    ContextAction::Append,
+                ));
+            }
+            // A service-provided continuation takes precedence over radio.
+            return;
+        }
+        if self
+            .connect_state
+            .player()
+            .context_metadata
+            .contains_key("lexicon_context_url")
+        {
+            return;
+        }
         let require_load_new = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
@@ -1729,6 +1848,7 @@ impl SpircTask {
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
+        let jump = track_uri.is_some() && !self.connect_state.repeat_track();
         let continue_playing = self.connect_state.is_playing();
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
@@ -1750,7 +1870,7 @@ impl SpircTask {
 
         if has_next_track {
             self.add_autoplay_resolving_when_required();
-            self.load_track(continue_playing, 0)
+            self.load_track_with_narration(continue_playing, 0, jump)
         } else {
             info!("Not playing next track because there are no more tracks left in queue.");
             self.handle_stop();
@@ -1888,6 +2008,14 @@ impl SpircTask {
     }
 
     fn position(&mut self) -> u32 {
+        if self.connect_state.narrating {
+            return self
+                .connect_state
+                .player()
+                .position_as_of_timestamp
+                .try_into()
+                .unwrap_or_default();
+        }
         match self.play_status {
             SpircPlayStatus::Stopped => 0,
             SpircPlayStatus::LoadingPlay { position_ms }
@@ -1900,6 +2028,17 @@ impl SpircTask {
     }
 
     fn load_track(&mut self, start_playing: bool, position_ms: u32) -> Result<(), Error> {
+        self.load_track_with_narration(start_playing, position_ms, false)
+    }
+
+    fn load_track_with_narration(
+        &mut self,
+        start_playing: bool,
+        position_ms: u32,
+        jump: bool,
+    ) -> Result<(), Error> {
+        self.pending_dj_transfer = false;
+        self.connect_state.narrating = false;
         if self.connect_state.current_track(MessageField::is_none) {
             debug!("current track is none, stopping playback");
             self.handle_stop();
@@ -1908,7 +2047,11 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+        let narration = self
+            .connect_state
+            .current_track(|track| Narration::from_metadata(&track.metadata, jump, position_ms));
+        self.player
+            .load_with_narration(id, start_playing, position_ms, narration);
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
@@ -1924,8 +2067,19 @@ impl SpircTask {
 
     async fn notify(&mut self) -> Result<(), Error> {
         self.connect_state.set_status(&self.play_status);
+        let dj = self.connect_state.is_active() && self.connect_state.is_dj();
+        if dj {
+            // Loads and transfers normalize shuffle without a Shuffle command.
+            // Publish the effective option before the DJ button's availability.
+            self.player
+                .emit_shuffle_changed_event(self.connect_state.shuffling_context());
+        }
+        self.player.emit_dj_state(
+            dj.then(|| self.connect_state.context_uri().clone()),
+            dj.then(|| self.connect_state.next_dj_set()).flatten(),
+        );
 
-        if self.connect_state.is_playing() {
+        if self.connect_state.is_playing() && !self.connect_state.narrating {
             self.connect_state
                 .update_position_in_relation(self.now_ms());
         }

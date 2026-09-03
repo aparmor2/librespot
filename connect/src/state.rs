@@ -1,4 +1,5 @@
 pub(super) mod context;
+mod dj;
 mod handle;
 mod metadata;
 mod options;
@@ -211,6 +212,7 @@ impl Default for ConnectConfig {
 
 #[derive(Default, Debug, Clone)]
 pub(super) struct ConnectState {
+    pub(crate) narrating: bool,
     /// the entire state that is updated to the remote server
     request: PutStateRequest,
 
@@ -371,6 +373,14 @@ impl ConnectState {
         &self.request.device.device_info
     }
 
+    pub fn set_dj_support(&mut self, supported: bool) {
+        if let Some(info) = self.device_mut().device_info.as_mut() {
+            if let Some(capabilities) = info.capabilities.as_mut() {
+                capabilities.supports_dj = supported;
+            }
+        }
+    }
+
     pub fn player(&self) -> &PlayerState {
         &self.request.device.player_state
     }
@@ -444,6 +454,7 @@ impl ConnectState {
     }
 
     pub(crate) fn set_status(&mut self, status: &SpircPlayStatus) {
+        let narrating = self.narrating;
         let player = self.player_mut();
         player.is_paused = matches!(
             status,
@@ -452,7 +463,7 @@ impl ConnectState {
                 | SpircPlayStatus::Stopped
         );
 
-        if player.is_paused {
+        if player.is_paused || narrating {
             player.playback_speed = 0.;
         } else {
             player.playback_speed = 1.;
