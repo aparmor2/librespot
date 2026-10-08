@@ -778,7 +778,6 @@ impl SpircTask {
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
                 warn!("SpircCommand::{cmd:?} will be ignored while already active")
             }
-<<<<<<< HEAD
             SpircCommand::Restore(snapshot) => {
                 if self.connect_state.is_active()
                     && !matches!(self.play_status, SpircPlayStatus::Stopped)
@@ -797,11 +796,9 @@ impl SpircTask {
             // `set_volume` records it in the device state and the mixer and
             // withholds the player event, and activation then reports it.
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-=======
             SpircCommand::DjNextSet(_) if !self.connect_state.is_active() => {
                 self.player.emit_dj_jump_rejected();
             }
->>>>>>> 3c79ae7 (Support experimental Spotify DJ sessions and narration)
             _ if !self.connect_state.is_active() => {
                 warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
             }
